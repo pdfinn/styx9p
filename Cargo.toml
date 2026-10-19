@@ -1,0 +1,22 @@
+[package]
+name = "styx9p"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Async 9P2000 (Styx) server and client for tokio, faithful to Plan 9 and Inferno: blocking reads, prompt Tflush, per-open file state"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pdfinn/styx9p"
+readme = "README.md"
+keywords = ["9p", "styx", "plan9", "inferno", "filesystem"]
+categories = ["network-programming", "filesystem", "asynchronous"]
+exclude = ["spike/", ".github/"]
+
+[dependencies]
+tokio = { version = "1.40", features = ["io-util", "net", "rt", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["io-util", "net", "rt", "rt-multi-thread", "sync", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
