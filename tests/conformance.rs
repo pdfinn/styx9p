@@ -743,3 +743,73 @@ async fn t22_many_readers_many_connections() {
         timeout(Duration::from_secs(2), t).await.expect("a reader never woke").unwrap();
     }
 }
+
+/// A read that already has its data is never dropped by a Tflush, even when
+/// the reply queue is full so the reply is still waiting to be sent (the
+/// File advanced its cursor to produce it: dropping it would lose an event).
+/// The number of replies queued ahead of the flush is swept so that, for
+/// some count, the flush is handled while the woken read is still waiting
+/// for queue space.
+#[tokio::test]
+async fn t23_flush_never_drops_a_read_that_has_its_data() {
+    for backlog in 40..110u16 {
+        let fs = Arc::new(ToyFs::default());
+        let (client_side, server_side) = tokio::io::duplex(64);
+        let server = Server::new(Shared(Arc::clone(&fs)));
+        tokio::spawn(async move { server.serve_conn(server_side).await });
+        let mut raw = Raw(client_side);
+        raw.send(NOTAG, Tmsg::Version { msize: 8192, version: "9P2000".into() }).await;
+        raw.recv().await.unwrap();
+        raw.send(1, Tmsg::Attach { fid: 0, afid: NOFID, uname: "t".into(), aname: "".into() })
+            .await;
+        raw.recv().await.unwrap();
+        raw.open(1, "stream").await;
+        raw.open(2, "hello").await;
+
+        let (mut rd, mut wr) = tokio::io::split(raw.0);
+        wr.write_all(&tread(1).encode(7)).await.unwrap(); // parks
+        // Queue replies faster than we read them, then flush tag 7.
+        let fs2 = Arc::clone(&fs);
+        let sender = tokio::spawn(async move {
+            for t in 0..backlog {
+                wr.write_all(&tread(2).encode(100 + t)).await.unwrap();
+            }
+            fs2.publish(); // tag 7's read now has its data
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            wr.write_all(&Tmsg::Flush { oldtag: 7 }.encode(8)).await.unwrap();
+            wr.write_all(&tread(1).encode(9)).await.unwrap();
+            wr
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Drain. Event 1 must arrive exactly once: on tag 7 (before
+        // Rflush) or, if tag 7 was cancelled in time, on tag 9.
+        let mut events = Vec::new();
+        let mut saw_flush = false;
+        loop {
+            let got = timeout(WAIT, async {
+                let size = rd.read_u32_le().await.unwrap();
+                let mut buf = vec![0u8; size as usize - 4];
+                rd.read_exact(&mut buf).await.unwrap();
+                Rmsg::decode(&buf).unwrap()
+            })
+            .await;
+            match got {
+                Ok((8, Rmsg::Flush)) => saw_flush = true,
+                Ok((tag @ (7 | 9), Rmsg::Read { data })) => {
+                    events.push((tag, String::from_utf8(data).unwrap()));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            // Decided: tag 9 answered, or tag 7 answered and was flushed.
+            if events.iter().any(|(t, _)| *t == 9) || (saw_flush && !events.is_empty()) {
+                break;
+            }
+        }
+        sender.await.unwrap();
+        assert!(saw_flush, "backlog {backlog}: no Rflush");
+        let ones: Vec<_> = events.iter().filter(|(_, e)| e == "event 1\n").collect();
+        assert_eq!(ones.len(), 1, "backlog {backlog}: event 1 lost or duplicated: {events:?}");
+    }
+}

@@ -14,9 +14,10 @@
 //! - [`File::read`] is async and **may park** for as long as it likes: the
 //!   server runs every read on its own task, so a blocked read never stalls
 //!   other requests on the connection.
-//! - `Tflush` aborts the named read, and `Rflush` follows promptly. The
-//!   flushed read never answers (unless its reply was already queued, in
-//!   which case it is sent before the `Rflush`, as `flush(5)` permits).
+//! - `Tflush` cancels the named read, and `Rflush` follows promptly. The
+//!   flushed read never answers, unless it had already returned its data:
+//!   that reply is never dropped (the `File` may have advanced a cursor to
+//!   produce it) and goes out before the `Rflush`, as `flush(5)` permits.
 //! - Directory reads are handled by the server from [`Filesystem::readdir`]:
 //!   whole stat entries only, served from a snapshot taken at offset 0, so a
 //!   listing that changes between reads can never tear an entry.
@@ -32,7 +33,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::proto::{
@@ -342,9 +343,32 @@ struct DirSnapshot {
     ends: Vec<usize>,
 }
 
+/// A read running on its own task.
 struct Inflight {
     fid: u32,
-    task: JoinHandle<()>,
+    /// Fired (or dropped) to cancel the read while it waits for data.
+    cancel: oneshot::Sender<()>,
+    /// Resolves to whether the read produced a reply.
+    task: JoinHandle<bool>,
+}
+
+impl Inflight {
+    /// Cancel the read if it is still waiting for data, and wait for its
+    /// task to finish. A read that already has its data is not cancelled:
+    /// the `File` may have advanced its state (a stream cursor) when it
+    /// returned, so dropping the reply would lose data. Returns whether the
+    /// read replied.
+    async fn cancel(self) -> bool {
+        let _ = self.cancel.send(());
+        self.task.await.unwrap_or(false)
+    }
+
+    /// Abort outright, reply or not: for when nothing more will be
+    /// delivered on this session (`Tversion`, disconnect).
+    async fn abort(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
 }
 
 struct Conn<F: Filesystem> {
@@ -412,9 +436,10 @@ impl<F: Filesystem> Conn<F> {
             Tmsg::Auth { .. } => Err(errors::NO_AUTH.into()),
             Tmsg::Attach { fid, afid, uname, aname } => self.attach(fid, afid, uname, aname),
             Tmsg::Flush { oldtag } => {
+                // A reply the read already has goes out first, then Rflush
+                // (flush(5) allows it).
                 if let Some(r) = self.inflight.remove(&oldtag) {
-                    r.task.abort();
-                    let _ = r.task.await;
+                    r.cancel().await;
                 }
                 Ok(Rmsg::Flush)
             }
@@ -451,8 +476,7 @@ impl<F: Filesystem> Conn<F> {
     /// Abort every in-flight read and wait for each to stop.
     async fn abort_all(&mut self) {
         for (_, r) in self.inflight.drain() {
-            r.task.abort();
-            let _ = r.task.await;
+            r.abort().await;
         }
     }
 
@@ -589,8 +613,15 @@ impl<F: Filesystem> Conn<F> {
         };
 
         let tx = self.tx.clone();
+        let (cancel, cancelled) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            let reply = match file.read(offset, count).await {
+            // The read is cancellable only until it returns.
+            let result = tokio::select! {
+                biased;
+                _ = cancelled => return false,
+                r = file.read(offset, count) => r,
+            };
+            let reply = match result {
                 Ok(mut data) => {
                     data.truncate(count as usize);
                     Rmsg::Read { data }
@@ -598,8 +629,9 @@ impl<F: Filesystem> Conn<F> {
                 Err(e) => Rmsg::Error { ename: e.0 },
             };
             let _ = tx.send(reply.encode(tag)).await;
+            true
         });
-        self.inflight.insert(tag, Inflight { fid, task });
+        self.inflight.insert(tag, Inflight { fid, cancel, task });
         Outcome::Spawned
     }
 
@@ -623,11 +655,8 @@ impl<F: Filesystem> Conn<F> {
             self.inflight.iter().filter(|(_, r)| r.fid == fid).map(|(t, _)| *t).collect();
         for tag in tags {
             let r = self.inflight.remove(&tag).unwrap();
-            r.task.abort();
-            if let Err(e) = r.task.await {
-                if e.is_cancelled() {
-                    let _ = self.tx.send(Rmsg::error(errors::CLUNKED).encode(tag)).await;
-                }
+            if !r.cancel().await {
+                let _ = self.tx.send(Rmsg::error(errors::CLUNKED).encode(tag)).await;
             }
         }
         Some(f)

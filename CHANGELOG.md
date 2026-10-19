@@ -16,4 +16,7 @@ First release.
   text; one that stops part way reports the element it stopped at.
 - `serve_tcp`/`serve_unix` retry failed accepts (e.g. EMFILE) instead of
   returning.
+- A `Tflush` (or clunk) never drops a read that has already returned its
+  data, even while its reply waits for queue space: the reply goes out
+  before the `Rflush`.
 - `Answer`, a helper for write-then-read query files.
