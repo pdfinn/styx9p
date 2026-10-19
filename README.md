@@ -104,6 +104,11 @@ cat /n/hello/ticks                          # interrupt it: no hang
 | `Filesystem` (`attach`, `walk1`, `stat`, `readdir`, `open`, and optionally `create`, `remove`, `wstat`) | synchronously, on the connection's task | the tree |
 | `File` (`read`, `write`) | `read`: its own task, cancellable; `write`: in order on the connection | per-open state |
 
+`File`'s methods take `&self` (a parked read and a write may be in flight
+on the same fid at once), so a `File` with state keeps it behind a lock:
+a `std::sync::Mutex` for state touched only between awaits, or a
+`tokio::sync::Mutex` held across a parked read to queue reads on one fid.
+
 Make `File::read` cancel-safe: a flushed read is dropped at whatever
 `.await` it is parked on, so commit state (advance a cursor) only as the
 last step before returning. `Answer` is a small helper for write-then-read
@@ -123,7 +128,7 @@ for s in c.read_dir(&[]).await? {
 }
 ```
 
-The client keeps one request in flight at a time: enough to consume a 9P
+`read_full` fills a buffer across as many reads as it takes. The client keeps one request in flight at a time: enough to consume a 9P
 service or test a server. For concurrent requests, open more connections or
 drive `styx9p::proto` (a complete, I/O-free codec for every 9P2000 message)
 directly.

@@ -280,11 +280,24 @@ async fn t01_static_read_write_stat_and_errors() {
     let st = c.stat_path(&["hello"]).await.unwrap();
     assert_eq!((st.name.as_str(), st.length, st.mode), ("hello", 6, 0o444));
 
-    // The filesystem's own error text reaches the client.
+    // The filesystem's own error text reaches the client; a walk that
+    // stops part way names the element it stopped at.
     match c.walk(&["ghost"]).await {
+        Err(ClientError::Server(m)) => assert_eq!(m, errors::NOT_FOUND),
+        other => panic!("expected the server's error, got {other:?}"),
+    }
+    match c.walk(&["sub", "ghost"]).await {
         Err(ClientError::NotFound(n)) => assert_eq!(n, "ghost"),
         other => panic!("expected not found, got {other:?}"),
     }
+
+    // read_full fills across Treads and reports a short file.
+    let fid = c.walk(&["hello"]).await.unwrap();
+    c.open(fid, OREAD).await.unwrap();
+    let mut buf = [0u8; 10];
+    assert_eq!(c.read_full(fid, 1, &mut buf).await.unwrap(), 5);
+    assert_eq!(&buf[..5], b"ello\n");
+    c.clunk(fid).await.unwrap();
     let mut raw = Raw::new(&fs).await;
     let r = raw.rpc(5, Tmsg::Walk { fid: 0, newfid: 1, wnames: vec!["ghost".into()] }).await;
     assert_eq!(ename(r), errors::NOT_FOUND);

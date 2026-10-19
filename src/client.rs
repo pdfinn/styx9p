@@ -20,7 +20,10 @@ pub enum ClientError {
     Io(io::Error),
     /// The server answered `Rerror` with this text.
     Server(String),
-    /// A walk stopped short: this path element does not exist.
+    /// A walk stopped short at this path element (the server answered the
+    /// walk, but without reaching it). When the server refuses the *first*
+    /// element of a walk with `Rerror`, that is [`ClientError::Server`],
+    /// carrying the server's own text.
     NotFound(String),
     /// The server sent something that is not a valid reply to the request.
     Protocol(String),
@@ -164,8 +167,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
                 Ok(Rmsg::Walk { wqids }) if wqids.len() == chunk.len() => None,
                 Ok(Rmsg::Walk { wqids }) => Some(chunk[wqids.len()].to_string()),
                 Ok(other) => return Err(unexpected("Rwalk", &other)),
-                Err(ClientError::Server(_)) if !chunk.is_empty() => Some(chunk[0].to_string()),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if i > 0 {
+                        let _ = self.clunk(newfid).await;
+                    }
+                    return Err(e);
+                }
             };
             if let Some(name) = missing {
                 if i > 0 {
@@ -206,6 +213,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
             }
             other => Err(unexpected("Rread", &other)),
         }
+    }
+
+    /// Fill `buf` from `offset`, issuing as many `Tread`s as it takes.
+    /// Returns the bytes read, which is less than `buf.len()` only if the
+    /// file ended first.
+    pub async fn read_full(&mut self, fid: Fid, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let mut done = 0;
+        while done < buf.len() {
+            let want = (buf.len() - done).min(self.iounit() as usize) as u32;
+            let chunk = self.read(fid, offset + done as u64, want).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            buf[done..done + chunk.len()].copy_from_slice(&chunk);
+            done += chunk.len();
+        }
+        Ok(done)
     }
 
     /// Read from `offset` until EOF, stopping with an error past `limit`

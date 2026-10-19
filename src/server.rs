@@ -243,22 +243,37 @@ impl<F: Filesystem> Server<F> {
     }
 
     /// Accept TCP connections forever, serving each on its own task.
+    ///
+    /// Accept errors (a connection reset before it was accepted, or running
+    /// out of file descriptors) are retried after a short pause rather than
+    /// ending the listener, so this does not return. For logging or
+    /// per-peer policy, write the accept loop yourself around
+    /// [`serve_conn`](Self::serve_conn).
     pub async fn serve_tcp(&self, listener: TcpListener) -> io::Result<()> {
         loop {
-            let (stream, _) = listener.accept().await?;
-            let _ = stream.set_nodelay(true);
-            let s = self.clone();
-            tokio::spawn(async move { s.serve_conn(stream).await });
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    let s = self.clone();
+                    tokio::spawn(async move { s.serve_conn(stream).await });
+                }
+                Err(_) => accept_pause().await,
+            }
         }
     }
 
-    /// Accept Unix-domain connections forever, serving each on its own task.
+    /// Accept Unix-domain connections forever, serving each on its own
+    /// task. Accept errors are retried as in [`serve_tcp`](Self::serve_tcp).
     #[cfg(unix)]
     pub async fn serve_unix(&self, listener: tokio::net::UnixListener) -> io::Result<()> {
         loop {
-            let (stream, _) = listener.accept().await?;
-            let s = self.clone();
-            tokio::spawn(async move { s.serve_conn(stream).await });
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let s = self.clone();
+                    tokio::spawn(async move { s.serve_conn(stream).await });
+                }
+                Err(_) => accept_pause().await,
+            }
         }
     }
 
@@ -298,6 +313,12 @@ impl<F: Filesystem> Server<F> {
             wrote.or_else(|e| if e.kind() == io::ErrorKind::BrokenPipe { Ok(()) } else { Err(e) }),
         )
     }
+}
+
+/// Back off after a failed accept: long enough for descriptors to free up,
+/// short enough not to be noticed.
+async fn accept_pause() {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
 struct FidState<T> {

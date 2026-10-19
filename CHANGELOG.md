@@ -10,6 +10,10 @@ First release.
   on their own tasks, prompt `Tflush`, whole-entry directory reads from a
   per-fid snapshot, `Tversion` session reset, `ORCLOSE`, optional
   `create`/`remove`/`wstat`. Serves TCP, Unix sockets, or any stream.
-- `Client`: one request at a time; walk, open, create, read, write, stat,
-  wstat, remove, and whole-file and directory conveniences.
+- `Client`: one request at a time; walk, open, create, read, `read_full`,
+  write, stat, wstat, remove, and whole-file and directory conveniences.
+  A walk refused on its first element reports the server's own error
+  text; one that stops part way reports the element it stopped at.
+- `serve_tcp`/`serve_unix` retry failed accepts (e.g. EMFILE) instead of
+  returning.
 - `Answer`, a helper for write-then-read query files.
